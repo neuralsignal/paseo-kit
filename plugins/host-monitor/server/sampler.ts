@@ -2,10 +2,13 @@ import { execFile } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { statfs } from "node:fs/promises";
 import os from "node:os";
+import { performance } from "node:perf_hooks";
 import { promisify } from "node:util";
 import type { RpcOutput } from "@getpaseo/plugin";
 import type { hostStatsRpc } from "../shared/stats";
 import type { DiskUsage, HostSample, MemoryPressure, MemoryUsage } from "../shared/stats";
+import { parseMacNetwork, summarizeMacNetwork } from "./mac-network";
+import type { MacNetworkReading, NetworkTotals } from "./mac-network";
 
 const execFileAsync = promisify(execFile);
 
@@ -17,7 +20,7 @@ const HISTORY_LENGTH = 90;
 const IGNORED_INTERFACE = /^(lo|veth|docker|br-|virbr)/;
 // Read-only images (snap packages, CDs) are always full and are not space anyone can run out of.
 const IGNORED_DISK_FS = new Set(["squashfs", "iso9660", "udf", "erofs"]);
-// A stuck macOS tool must not hold up the sample; the previous reading is kept instead.
+// A stuck macOS tool must not hold up the sample.
 const MAC_COMMAND_TIMEOUT_MS = 1500;
 // kern.memorystatus_vm_pressure_level, as defined by the kernel's kVMPressure* constants.
 const MAC_PRESSURE_LEVELS: Record<string, MemoryPressure> = { "1": "normal", "2": "warning", "4": "critical" };
@@ -25,11 +28,6 @@ const MAC_PRESSURE_LEVELS: Record<string, MemoryPressure> = { "1": "normal", "2"
 interface CpuTimes {
   idle: number;
   total: number;
-}
-
-interface NetworkTotals {
-  rx: number;
-  tx: number;
 }
 
 /**
@@ -148,7 +146,17 @@ async function readMacMemory(): Promise<MemoryUsage | null> {
   return memory ? { ...memory, pressure } : null;
 }
 
-function readNetworkTotals(): NetworkTotals | null {
+async function readMacNetwork(): Promise<MacNetworkReading | null> {
+  try {
+    const { stdout } = await execFileAsync("/usr/sbin/netstat", ["-ibn"], { timeout: MAC_COMMAND_TIMEOUT_MS });
+    const interfaces = parseMacNetwork(stdout);
+    return interfaces ? { at: performance.now(), interfaces } : null;
+  } catch {
+    return null;
+  }
+}
+
+function readProcNetworkTotals(): NetworkTotals | null {
   let raw: string;
   try {
     raw = readFileSync("/proc/net/dev", "utf8");
@@ -238,7 +246,7 @@ export function startSampler(): { read(): Promise<HostStats>; stop(): void } {
   const isMac = process.platform === "darwin";
   const history: HostSample[] = [];
   let previousCpu = readCpuTimes();
-  let previousNet = readNetworkTotals();
+  let previousNet = isMac ? null : readProcNetworkTotals();
   let previousAt = Date.now();
   let networkTotals = previousNet;
   let disks: DiskUsage[] = [];
@@ -246,6 +254,9 @@ export function startSampler(): { read(): Promise<HostStats>; stop(): void } {
   let macMemory: MemoryUsage | null = null;
   let macMemoryRead: Promise<void> | null = null;
   let memory = readMemory();
+  let macNetwork: MacNetworkReading | null = null;
+  let previousMacNetwork: MacNetworkReading | null = null;
+  let macNetworkRead: Promise<void> | null = null;
 
   // vm_stat runs as a separate process, so each tick uses the reading the previous one started.
   const refreshMacMemory = () => {
@@ -259,10 +270,22 @@ export function startSampler(): { read(): Promise<HostStats>; stop(): void } {
     return macMemoryRead;
   };
 
+  const refreshMacNetwork = () => {
+    macNetworkRead ??= readMacNetwork()
+      .then((next) => {
+        macNetwork = next;
+      })
+      .finally(() => {
+        macNetworkRead = null;
+      });
+    return macNetworkRead;
+  };
+
   const tick = () => {
     const now = Date.now();
     const cpu = readCpuTimes();
-    const net = readNetworkTotals();
+    const net = isMac ? null : readProcNetworkTotals();
+    const macNet = macNetwork ? summarizeMacNetwork(macNetwork, previousMacNetwork) : null;
     const seconds = Math.max((now - previousAt) / 1000, 0.001);
     const totalDelta = cpu.total - previousCpu.total;
     const idleDelta = cpu.idle - previousCpu.idle;
@@ -273,16 +296,17 @@ export function startSampler(): { read(): Promise<HostStats>; stop(): void } {
       at: now,
       cpuPercent: totalDelta > 0 ? (1 - idleDelta / totalDelta) * 100 : 0,
       memoryPercent: (memory.usedBytes / memory.totalBytes) * 100,
-      rxBytesPerSec: net && previousNet ? Math.max(net.rx - previousNet.rx, 0) / seconds : 0,
-      txBytesPerSec: net && previousNet ? Math.max(net.tx - previousNet.tx, 0) / seconds : 0,
+      rxBytesPerSec: macNet?.rxBytesPerSec ?? (net && previousNet ? Math.max(net.rx - previousNet.rx, 0) / seconds : 0),
+      txBytesPerSec: macNet?.txBytesPerSec ?? (net && previousNet ? Math.max(net.tx - previousNet.tx, 0) / seconds : 0),
     };
     history.push(sample);
     if (history.length > HISTORY_LENGTH) history.shift();
 
     previousCpu = cpu;
     previousNet = net;
+    previousMacNetwork = macNetwork;
     previousAt = now;
-    networkTotals = net;
+    networkTotals = macNet?.totals ?? net;
   };
 
   const refreshDisks = () => {
@@ -298,10 +322,12 @@ export function startSampler(): { read(): Promise<HostStats>; stop(): void } {
       });
   };
 
-  // On macOS the first sample waits for vm_stat, so the history does not open with os.freemem's figure.
-  const firstSample = isMac ? refreshMacMemory().then(tick) : Promise.resolve(tick());
+  const firstSample = isMac ? Promise.all([refreshMacMemory(), refreshMacNetwork()]).then(tick) : Promise.resolve(tick());
   refreshDisks();
-  const timer = setInterval(tick, SAMPLE_INTERVAL_MS);
+  const timer = setInterval(() => {
+    tick();
+    if (isMac) void refreshMacNetwork();
+  }, SAMPLE_INTERVAL_MS);
   const diskTimer = setInterval(refreshDisks, DISK_INTERVAL_MS);
 
   return {
