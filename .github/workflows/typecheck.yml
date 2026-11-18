@@ -27,6 +27,9 @@ jobs:
           cache-dependency-path: plugins/${{ matrix.plugin }}/package-lock.json
       - run: npm ci
       - run: npm run typecheck
+      - name: Test Host Monitor counter parsing
+        if: matrix.plugin == 'host-monitor'
+        run: npm test
       - name: Mobile audit (client/)
         run: |
           hits=$(grep -rnE "document\.|window\.|localStorage|navigator\.|className=|onClick=" client/ --include='*.ts' --include='*.tsx' | grep -v '^client/web\.ts:' || true)

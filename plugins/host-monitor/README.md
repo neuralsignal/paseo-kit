@@ -23,6 +23,7 @@ Requires Paseo 0.11.1 or later with plugins enabled on the daemon.
 
 ```bash
 npm run typecheck
+npm test
 paseo plugin reload host-monitor
 paseo plugin logs host-monitor
 ```
