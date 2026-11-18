@@ -1,0 +1,31 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions-routine:
+        patterns: ["*"]
+        update-types: [minor, patch]
+  - package-ecosystem: npm
+    directories:
+      - /plugins/host-monitor
+      - /plugins/ccusage-stats
+      - /plugins/file-download
+      - /plugins/tab-recovery
+      - /plugins/media-studio
+    schedule:
+      interval: weekly
+    groups:
+      npm-routine:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    # Paseo provides these at runtime. Upgrade them together against a supported host.
+    ignore:
+      - dependency-name: "@getpaseo/*"
+      - dependency-name: "@types/react"
+      - dependency-name: "@tanstack/react-query"
+      - dependency-name: react
+      - dependency-name: react-native
+      - dependency-name: zod

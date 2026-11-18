@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   typecheck:
     runs-on: ubuntu-latest
@@ -28,3 +31,14 @@ jobs:
         run: |
           hits=$(grep -rnE "document\.|window\.|localStorage|navigator\.|className=|onClick=" client/ --include='*.ts' --include='*.tsx' | grep -v '^client/web\.ts:' || true)
           if [ -n "$hits" ]; then echo "$hits"; exit 1; fi
+
+  required-check:
+    name: Typecheck passed
+    needs: typecheck
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify every plugin passed
+        env:
+          RESULT: ${{ needs.typecheck.result }}
+        run: test "$RESULT" = success
